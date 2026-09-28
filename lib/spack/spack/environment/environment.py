@@ -2176,10 +2176,15 @@ class Environment:
         Yields both added and installed specs that have user specs in
         ``spack.yaml``.
         """
-        concretized = dict(self.concretized_specs())
-        for spec in self.user_specs:
-            concrete = concretized.get(spec)
-            yield concrete if concrete else spec
+        for group in self.manifest.groups():
+            concrete_specs = {
+                x.root: self.specs_by_hash[x.hash]
+                for x in self.concretized_roots
+                if x.group == group and x.hash in self.specs_by_hash
+            }
+            for spec in self.user_specs_by(group=group):
+                concrete = concrete_specs.get(spec)
+                yield concrete if concrete else spec
 
     def added_specs(self):
         """Specs that are not yet installed.
@@ -2190,13 +2195,18 @@ class Environment:
         # use a transaction to avoid overhead of repeated calls
         # to `Database.installed`
         with spack.store.STORE.db.read_transaction():
-            concretized = dict(self.concretized_specs())
-            for spec in self.user_specs:
-                concrete = concretized.get(spec)
-                if not concrete:
-                    yield spec
-                elif not spack.store.STORE.db.installed(concrete):
-                    yield concrete
+            for group in self.manifest.groups():
+                concrete_specs = {
+                    x.root: self.specs_by_hash[x.hash]
+                    for x in self.concretized_roots
+                    if x.group == group and x.hash in self.specs_by_hash
+                }
+                for spec in self.user_specs_by(group=group):
+                    concrete = concrete_specs.get(spec)
+                    if not concrete:
+                        yield spec
+                    elif not spack.store.STORE.db.installed(concrete):
+                        yield concrete
 
     def concretized_specs(self):
         """Tuples of (user spec, concrete spec) for all concrete specs."""

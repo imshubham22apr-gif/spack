@@ -456,3 +456,125 @@ def test_concretizing_single_spec_announces_no_group(unify, mutable_config):
 
     assert "Starting concretization" not in output
     assert "group of specs" not in output
+
+
+def test_spec_group_requires_env():
+    """Tests that -g/--group requires an active environment."""
+    with pytest.raises(SpackCommandError):
+        spec("-g", "mygroup")
+
+    with pytest.raises(SpackCommandError):
+        spec("-g", "mygroup", "libelf")
+
+
+def test_spec_group_nonexistent(tmp_path: pathlib.Path):
+    """Tests that passing a non-existent group fails."""
+    (tmp_path / ev.manifest_name).write_text(
+        """\
+spack:
+  specs:
+  - group: tools
+    specs:
+    - libelf
+"""
+    )
+    with ev.Environment(tmp_path):
+        with pytest.raises(SpackCommandError):
+            spec("-g", "nonexistent")
+
+        with pytest.raises(SpackCommandError):
+            spec("-g", "nonexistent", "libelf")
+
+
+def test_spec_group_constrains_roots(tmp_path: pathlib.Path):
+    """Tests that `spack spec -g <group>` only outputs the roots for the requested group."""
+    (tmp_path / ev.manifest_name).write_text(
+        """\
+spack:
+  specs:
+  - group: tools
+    specs:
+    - libelf
+  - group: mpi
+    specs:
+    - mpich
+"""
+    )
+    with ev.Environment(tmp_path):
+        out_tools = spec("--json", "-g", "tools")
+        specs_tools = [
+            spack.spec.Spec.from_dict(json.loads(x)) for x in out_tools.splitlines() if x.strip()
+        ]
+        assert len(specs_tools) == 1
+        assert specs_tools[0].name == "libelf"
+
+        out_mpi = spec("--json", "-g", "mpi")
+        specs_mpi = [
+            spack.spec.Spec.from_dict(json.loads(x)) for x in out_mpi.splitlines() if x.strip()
+        ]
+        assert len(specs_mpi) == 1
+        assert specs_mpi[0].name == "mpich"
+
+
+def test_spec_group_applies_override_to_passed_spec(tmp_path: pathlib.Path):
+    """Tests that `spack spec -g <group> <spec>` applies the group's override."""
+    (tmp_path / ev.manifest_name).write_text(
+        """\
+spack:
+  specs:
+  - group: pinned12
+    override:
+      packages:
+        libelf:
+          require: "@0.8.12"
+    specs:
+    - libelf
+  - group: pinned13
+    override:
+      packages:
+        libelf:
+          require: "@0.8.13"
+    specs:
+    - libelf
+"""
+    )
+    with ev.Environment(tmp_path):
+        out12 = spec("--json", "-g", "pinned12", "libelf")
+        s12 = spack.spec.Spec.from_dict(json.loads(out12.strip()))
+        assert s12.satisfies("libelf@0.8.12")
+
+        out13 = spec("--json", "-g", "pinned13", "libelf")
+        s13 = spack.spec.Spec.from_dict(json.loads(out13.strip()))
+        assert s13.satisfies("libelf@0.8.13")
+
+
+def test_spec_group_variant_override(tmp_path: pathlib.Path):
+    """Tests that `spack spec -g <group> <spec>` applies variant overrides correctly."""
+    (tmp_path / ev.manifest_name).write_text(
+        """\
+spack:
+  specs:
+  - group: opt
+    override:
+      packages:
+        mpileaks:
+          require: "+opt"
+    specs:
+    - mpileaks
+  - group: noopt
+    override:
+      packages:
+        mpileaks:
+          require: "~opt"
+    specs:
+    - mpileaks
+"""
+    )
+    with ev.Environment(tmp_path):
+        out_opt = spec("--json", "-g", "opt", "mpileaks")
+        s_opt = spack.spec.Spec.from_dict(json.loads(out_opt.strip()))
+        assert s_opt.satisfies("mpileaks+opt")
+
+        out_noopt = spec("--json", "-g", "noopt", "mpileaks")
+        s_noopt = spack.spec.Spec.from_dict(json.loads(out_noopt.strip()))
+        assert s_noopt.satisfies("mpileaks~opt")

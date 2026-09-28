@@ -264,34 +264,39 @@ def display_env(env, args, decorator, results, status_fn=None):
     root_spec_str = f"{total_roots or 'no'} root {'spec' if total_roots == 1 else 'specs'}"
     tty.msg(f"In environment {env.name} ({root_spec_str})")
 
-    concrete_specs = {x.root: env.specs_by_hash[x.hash] for x in env.concretized_roots}
     _status_fn = status_fn if status_fn is not None else spack.store.STORE.db.install_status
-
-    def root_decorator(spec, string):
-        """Decorate root specs with their install status if needed"""
-        concrete = concrete_specs.get(spec)
-        if concrete:
-            status = color.colorize(_status_fn(concrete).value)
-            hash = concrete.dag_hash()
-        else:
-            status = color.colorize(spack.spec.InstallStatus.absent.value)
-            hash = "-" * 32
-
-        # TODO: status has two extra spaces on the end of it, but fixing this and other spec
-        # TODO: space format idiosyncrasies is complicated. Fix this eventually
-        status = status[:-2]
-
-        if args.long or args.very_long:
-            hash = color.colorize(f"@K{{{hash[: 7 if args.long else None]}}}")
-            return f"{status} {hash} {string}"
-        else:
-            return f"{status} {string}"
 
     with spack.store.STORE.db.read_transaction():
         for group in env.manifest.groups():
             group_specs = env.user_specs_by(group=group)
             if not group_specs:
                 continue
+
+            concrete_specs = {
+                x.root: env.specs_by_hash[x.hash]
+                for x in env.concretized_roots
+                if x.group == group and x.hash in env.specs_by_hash
+            }
+
+            def root_decorator(spec, string):
+                """Decorate root specs with their install status if needed"""
+                concrete = concrete_specs.get(spec)
+                if concrete:
+                    status = color.colorize(_status_fn(concrete).value)
+                    hash = concrete.dag_hash()
+                else:
+                    status = color.colorize(spack.spec.InstallStatus.absent.value)
+                    hash = "-" * 32
+
+                # TODO: status has two extra spaces on the end of it, but fixing this and
+                # TODO: other spec space format idiosyncrasies is complicated. Fix this eventually
+                status = status[:-2]
+
+                if args.long or args.very_long:
+                    hash = color.colorize(f"@K{{{hash[: 7 if args.long else None]}}}")
+                    return f"{status} {hash} {string}"
+                else:
+                    return f"{status} {string}"
 
             if env.has_groups():
                 header = (

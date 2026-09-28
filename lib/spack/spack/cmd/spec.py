@@ -15,6 +15,7 @@ import spack.traverse
 from spack.active_environment import active_environment
 from spack.cmd.common import arguments
 from spack.concretize_ui import HeadlessUI, TerminalUI
+from spack.util import tty
 from spack.util.lang import nullcontext
 
 description = "show what would be installed, given a spec"
@@ -62,6 +63,13 @@ for further documentation regarding the spec syntax, see:
     arguments.add_common_arguments(format_group, ["show_non_defaults"])
 
     subparser.add_argument(
+        "-g",
+        "--group",
+        default=None,
+        metavar="GROUP",
+        help="show specs for a specific environment spec group (requires an active environment)",
+    )
+    subparser.add_argument(
         "-c",
         "--cover",
         action="store",
@@ -83,14 +91,31 @@ def spec(parser, args):
 
     env = active_environment()
 
+    if args.group:
+        if not env:
+            args.subparser.error("the argument -g/--group requires an active environment")
+        try:
+            env.manifest._ensure_group_exists(args.group)
+        except ValueError as e:
+            tty.die(str(e))
+
     # Machine-readable output goes to stdout, so concretization must not print anything there
     ui = HeadlessUI() if args.format else TerminalUI()
 
     if args.specs:
-        concrete_specs = spack.cmd.parse_specs(args.specs, concretize=True, ui=ui)
+        if args.group:
+            with env.config_override_for_group(group=args.group):
+                concrete_specs = spack.cmd.parse_specs(args.specs, concretize=True, ui=ui)
+        else:
+            concrete_specs = spack.cmd.parse_specs(args.specs, concretize=True, ui=ui)
     elif env:
         env.concretize(ui=ui)
-        concrete_specs = env.concrete_roots()
+        if args.group:
+            concrete_specs = [
+                concrete for _, concrete in env.concretized_specs_by(group=args.group)
+            ]
+        else:
+            concrete_specs = env.concrete_roots()
     else:
         args.subparser.error("requires at least one spec or an active environment")
 

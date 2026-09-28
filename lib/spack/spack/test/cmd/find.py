@@ -606,3 +606,48 @@ def test_find_env_with_groups(spack_yaml, expected, not_expected, tmp_path: path
 
     assert all(x in output for x in expected)
     assert all(x not in output for x in not_expected)
+
+
+def test_find_env_with_groups_distinct_root_hashes(
+    mutable_mock_env_path, mutable_mock_repo, tmp_path: pathlib.Path
+):
+    """Tests that spack find -l displays the correct distinct hash for the same root spec
+    across different spec groups.
+    """
+    (tmp_path / "spack.yaml").write_text(
+        """\
+spack:
+  specs:
+  - group: g12
+    override:
+      packages:
+        libelf:
+          require: "@0.8.12"
+    specs:
+    - libelf
+  - group: g13
+    override:
+      packages:
+        libelf:
+          require: "@0.8.13"
+    specs:
+    - libelf
+"""
+    )
+    with ev.Environment(tmp_path) as env:
+        env.concretize()
+        output = find("-l")
+
+        _, g12_spec = next(iter(env.concretized_specs_by(group="g12")))
+        _, g13_spec = next(iter(env.concretized_specs_by(group="g13")))
+        h12 = g12_spec.dag_hash()[:7]
+        h13 = g13_spec.dag_hash()[:7]
+
+        assert h12 != h13
+        parts = output.split("-- root specs / ")
+        g12_part = next(p for p in parts if p.startswith("g12"))
+        g13_part = next(p for p in parts if p.startswith("g13"))
+        assert h12 in g12_part
+        assert h13 not in g12_part
+        assert h13 in g13_part
+        assert h12 not in g13_part
