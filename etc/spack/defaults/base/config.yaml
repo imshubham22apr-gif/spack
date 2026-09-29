@@ -27,6 +27,10 @@ config:
     # if padded_length is an integer, Spack will pad to that many characters,
     # assuming it is higher than the length of the install_tree root.
     # padded_length: 128
+    # install_tree can also include an optional temporary install_stage.
+    # When set, packages are installed with padding into install_stage first,
+    # then relocated to the unpadded install_tree root.
+    # install_stage: $tempdir/$user/spack-install-stage
 
 
   # Locations where templates should be found

@@ -72,6 +72,10 @@ properties: Dict[str, Any] = {
                         "relocation of binaries (true for max length, integer for specific "
                         "length)",
                     },
+                    "install_stage": {
+                        "oneOf": [{"type": "string"}, {"type": "boolean"}, {"type": "null"}],
+                        "description": "Staging prefix for relocation to install_tree",
+                    },
                     **spack.schema.projections.ref_properties,
                 },
             },
@@ -79,6 +83,10 @@ properties: Dict[str, Any] = {
                 "type": "integer",
                 "minimum": 1,
                 "description": "Length of hash used in installation directory names",
+            },
+            "install_stage": {
+                "oneOf": [{"type": "string"}, {"type": "boolean"}, {"type": "null"}],
+                "description": "Staging prefix for relocation to install_tree",
             },
             "build_stage": {
                 "oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}],

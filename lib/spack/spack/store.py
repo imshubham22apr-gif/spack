@@ -67,7 +67,11 @@ def parse_install_tree(config: spack.config.Configuration) -> Tuple[str, str, Di
 
     unpadded_root = unpadded_root.rstrip(os.path.sep)
 
-    if padded_length:
+    install_stage_cfg = config.get_config("config").get("install_stage", None)
+    if install_stage_cfg is None:
+        install_stage_cfg = install_tree.get("install_stage", None)
+
+    if padded_length and not install_stage_cfg:
         root = spack.util.path.add_padding(unpadded_root, padded_length)
         if len(root) != padded_length:
             msg = "Cannot pad %s to %s characters." % (root, padded_length)
@@ -77,6 +81,45 @@ def parse_install_tree(config: spack.config.Configuration) -> Tuple[str, str, Di
         root = unpadded_root
 
     return root, unpadded_root, projections
+
+
+def get_install_stage_root(config: Optional[spack.config.Configuration] = None) -> Optional[str]:
+    """Return the root path for install_stage, with padding applied if padded_length is set.
+
+    Returns None if install_stage is not configured.
+    """
+    if config is None:
+        config = spack.config.CONFIG
+
+    install_tree = config.get_config("config").get("install_tree", {})
+    install_stage_cfg = config.get_config("config").get("install_stage", None)
+    if install_stage_cfg is None:
+        install_stage_cfg = install_tree.get("install_stage", None)
+
+    if not install_stage_cfg:
+        return None
+
+    if install_stage_cfg is True:
+        install_stage_path = "$tempdir/$user/spack-install-stage"
+    else:
+        install_stage_path = str(install_stage_cfg)
+
+    install_stage_root = spack.config.canonicalize_path(install_stage_path, config=config)
+    install_stage_root = install_stage_root.rstrip(os.path.sep)
+
+    padded_length: Union[bool, int] = install_tree.get("padded_length", False)
+    if padded_length is True:
+        padded_length = spack.util.path.get_system_path_max()
+        padded_length -= spack.util.path.SPACK_MAX_INSTALL_PATH_LENGTH
+
+    if padded_length:
+        install_stage_root = spack.util.path.add_padding(install_stage_root, padded_length)
+        if len(install_stage_root) != padded_length:
+            msg = f"Cannot pad {install_stage_root} to {padded_length} characters."
+            msg += f" It is already {len(install_stage_root)} characters long"
+            tty.warn(msg)
+
+    return install_stage_root
 
 
 @contextlib.contextmanager

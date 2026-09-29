@@ -567,6 +567,14 @@ def read_buildinfo_file(prefix):
         return syaml.load(f)
 
 
+def write_buildinfo_file(prefix: str, buildinfo: dict) -> None:
+    """Write buildinfo file to prefix/.spack/binary_distribution"""
+    filename = buildinfo_file_name(prefix)
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    with open(filename, "w", encoding="utf-8") as f:
+        syaml.dump(buildinfo, stream=f)
+
+
 def file_matches(f: IO[bytes], regex: spack.util.lang.PatternBytes) -> bool:
     try:
         return bool(regex.search(f.read()))
@@ -590,11 +598,17 @@ def specs_to_relocate(spec: spack.spec.Spec) -> List[spack.spec.Spec]:
 
 def get_buildinfo_dict(spec):
     """Create metadata for a tarball"""
+    staging_root = spack.store.get_install_stage_root()
+    if staging_root and str(spec.prefix).startswith(staging_root):
+        buildpath = staging_root
+    else:
+        buildpath = spack.store.STORE.layout.root
+
     return {
         "sbang_install_path": spack.hooks.sbang.sbang_install_path(),
-        "buildpath": spack.store.STORE.layout.root,
+        "buildpath": buildpath,
         "spackprefix": spack.paths.prefix,
-        "relative_prefix": os.path.relpath(spec.prefix, spack.store.STORE.layout.root),
+        "relative_prefix": os.path.relpath(spec.prefix, buildpath),
         # "relocate_textfiles": [],
         # "relocate_binaries": [],
         # "relocate_links": [],
@@ -982,10 +996,79 @@ def _exists_in_buildcache(
     return cache_entry
 
 
+def scan_prefix_for_relocation(
+    prefix: str, prefixes_to_relocate: List[str]
+) -> Dict[str, List[str]]:
+    """Scan an install prefix to identify binaries, text files, and symlinks needing relocation."""
+    if not os.path.isabs(prefix) or not os.path.isdir(prefix):
+        raise ValueError(f"prefix '{prefix}' must be an absolute path to a directory")
+    stat_key = lambda stat: (stat.st_dev, stat.st_ino)
+    try:
+        files_to_skip = {stat_key(os.lstat(buildinfo_file_name(prefix)))}
+    except OSError:
+        files_to_skip = set()
+
+    binary_regex = utf8_paths_to_single_binary_regex(prefixes_to_relocate)
+
+    relocate_binaries = []
+    relocate_links = []
+    relocate_textfiles = []
+
+    for root, dirs, files in os.walk(prefix):
+        for entry_name in files:
+            full_path = os.path.join(root, entry_name)
+            relpath = os.path.relpath(full_path, prefix)
+            if relpath.split(os.sep, 1)[0] == ".spack":
+                continue
+            try:
+                st = os.lstat(full_path)
+            except OSError:
+                continue
+            if stat_key(st) in files_to_skip:
+                continue
+            if os.path.islink(full_path):
+                try:
+                    link_target = os.readlink(full_path)
+                except OSError:
+                    continue
+                if os.path.isabs(link_target) and binary_regex.match(link_target.encode("utf-8")):
+                    relocate_links.append(relpath)
+            else:
+                try:
+                    with open(full_path, "rb") as f:
+                        f_type = file_type(f)
+                        if f_type == FileTypes.BINARY:
+                            relocate_binaries.append(relpath)
+                        elif f_type == FileTypes.TEXT and file_matches(f, binary_regex):
+                            relocate_textfiles.append(relpath)
+                except OSError:
+                    continue
+
+        for entry_name in dirs:
+            full_path = os.path.join(root, entry_name)
+            if os.path.islink(full_path):
+                relpath = os.path.relpath(full_path, prefix)
+                try:
+                    link_target = os.readlink(full_path)
+                except OSError:
+                    continue
+                if os.path.isabs(link_target) and binary_regex.match(link_target.encode("utf-8")):
+                    relocate_links.append(relpath)
+
+    return {
+        "relocate_binaries": relocate_binaries,
+        "relocate_links": relocate_links,
+        "relocate_textfiles": relocate_textfiles,
+    }
+
+
 def prefixes_to_relocate(spec):
     prefixes = [s.prefix for s in specs_to_relocate(spec)]
     prefixes.append(spack.hooks.sbang.sbang_install_path())
     prefixes.append(str(spack.store.STORE.layout.root))
+    staging_root = spack.store.get_install_stage_root()
+    if staging_root and staging_root not in prefixes:
+        prefixes.append(staging_root)
     return prefixes
 
 

@@ -625,7 +625,9 @@ def _archive_build_metadata(pkg: "spack.package_base.PackageBase") -> None:
         spack.util.tty.debug(e)
 
 
-def _enable_sandbox(config: dict, spec: spack.spec.Spec, stage_path: str) -> None:
+def _enable_sandbox(
+    config: dict, spec: spack.spec.Spec, stage_path: str, final_prefix: Optional[str] = None
+) -> None:
     if not config.get("enable", False):
         return
 
@@ -640,6 +642,8 @@ def _enable_sandbox(config: dict, spec: spack.spec.Spec, stage_path: str) -> Non
 
     sandbox.allow_write(stage_path)
     sandbox.allow_write(spec.prefix)
+    if final_prefix and final_prefix != spec.prefix:
+        sandbox.allow_write(final_prefix)
 
     # POSIX prescribes /tmp and /dev/null are present. In the future we can consider setting
     # TMPPATH to a sibling of the stage path to isolate concurrent builds better.
@@ -682,6 +686,88 @@ def _rewire_no_db(
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _autopush_from_staging(spec: spack.spec.Spec) -> None:
+    """Autopush a package to binary cache mirrors while still in staging_prefix with padding."""
+    if spec.external:
+        return
+    pkg = spec.package
+    if getattr(pkg, "_autopushed", False):
+        return
+    if getattr(pkg, "installed_from_binary_cache", False):
+        return
+
+    autopush_mirrors = spack.mirrors.mirror.MirrorCollection(binary=True, autopush=True).values()
+    if not autopush_mirrors:
+        return
+
+    for mirror in autopush_mirrors:
+        if not mirror.matches_binary(spec, direction="push"):
+            spack.util.tty.debug(
+                f"{spec.name}: Skipped push to '{mirror.name}' due to include/exclude filters"
+            )
+            continue
+        signing_key = spack.binary_distribution.select_signing_key() if mirror.signed else None
+        with spack.binary_distribution.make_uploader(
+            mirror=mirror, force=True, signing_key=signing_key
+        ) as uploader:
+            uploader.push_or_raise([spec])
+        spack.util.tty.msg(f"{spec.name}: Pushed to build cache: '{mirror.name}'")
+
+    pkg._autopushed = True
+
+
+def _relocate_install_stage(
+    pkg: "spack.package_base.PackageBase",
+    spec: spack.spec.Spec,
+    staging_prefix: str,
+    final_prefix: str,
+    staging_root: str,
+    store: spack.store.Store,
+    timer: spack.util.timer.Timer,
+    keep_stage: bool = False,
+) -> None:
+    """Package and relocate an installation from staging_prefix to final_prefix."""
+    prefixes = spack.binary_distribution.prefixes_to_relocate(spec)
+    if staging_root not in prefixes:
+        prefixes.append(staging_root)
+    if staging_prefix not in prefixes:
+        prefixes.append(staging_prefix)
+
+    relocation_info = spack.binary_distribution.scan_prefix_for_relocation(
+        staging_prefix, prefixes
+    )
+
+    buildinfo = spack.binary_distribution.get_buildinfo_dict(spec)
+    buildinfo["buildpath"] = staging_root
+    buildinfo["relative_prefix"] = os.path.relpath(staging_prefix, staging_root)
+    buildinfo.update(relocation_info)
+    spack.binary_distribution.write_buildinfo_file(staging_prefix, buildinfo)
+
+    # Autopush while in staging so binary cache contains the relocatable padded prefix
+    _autopush_from_staging(spec)
+
+    if os.path.exists(final_prefix):
+        shutil.rmtree(final_prefix)
+    os.makedirs(os.path.dirname(final_prefix), exist_ok=True)
+    shutil.move(staging_prefix, final_prefix)
+
+    if not keep_stage:
+        parent = os.path.dirname(staging_prefix)
+        while parent and parent != staging_root and parent.startswith(staging_root):
+            try:
+                os.rmdir(parent)
+                parent = os.path.dirname(parent)
+            except OSError:
+                break
+
+    # 7. Update spec prefix to final destination
+    spec.set_prefix(final_prefix)
+
+    # 8. Relocate package to final_prefix
+    with timer.measure("relocate"):
+        spack.binary_distribution.relocate_package(spec)
+
+
 def _install(
     request: BuildRequest, state_stream: io.TextIOWrapper, store: spack.store.Store
 ) -> None:
@@ -721,88 +807,122 @@ def _install(
         send_state("no binary available", state_stream)
         raise BinaryCacheMiss(f"No binary available for {spec}")
 
-    unmodified_env = os.environ.copy()
-    env_mods = spack.build_environment.setup_package(pkg, dirty=request.dirty)
-    store.layout.create_install_directory(spec)
+    staging_root = spack.store.get_install_stage_root()
+    staging_prefix = None
+    final_prefix = spec.prefix
+    if staging_root:
+        rel_prefix = os.path.relpath(final_prefix, store.layout.root)
+        staging_prefix = os.path.join(staging_root, rel_prefix)
+        spec.set_prefix(staging_prefix)
 
-    stage = pkg.stage
-    stage.keep = request.keep_stage
+    try:
+        unmodified_env = os.environ.copy()
+        env_mods = spack.build_environment.setup_package(pkg, dirty=request.dirty)
+        store.layout.create_install_directory(spec)
 
-    # Then try a source build.
-    with stage:
-        if request.restage:
-            stage.destroy()
-        stage.create()
+        stage = pkg.stage
+        stage.keep = request.keep_stage
 
-        # Write build environment and env-mods to stage
-        spack.util.environment.dump_environment(pkg.env_path)
-        with open(pkg.env_mods_path, "w", encoding="utf-8") as f:
-            f.write(env_mods.shell_modifications(explicit=True, env=unmodified_env))
+        # Then try a source build.
+        with stage:
+            if request.restage:
+                stage.destroy()
+            stage.create()
 
-        # Try to snapshot configure/cmake args before phases run
-        for attr in ("configure_args", "cmake_args"):
+            # Write build environment and env-mods to stage
+            spack.util.environment.dump_environment(pkg.env_path)
+            with open(pkg.env_mods_path, "w", encoding="utf-8") as f:
+                f.write(env_mods.shell_modifications(explicit=True, env=unmodified_env))
+
+            # Try to snapshot configure/cmake args before phases run
+            for attr in ("configure_args", "cmake_args"):
+                try:
+                    args = getattr(pkg, attr)()
+                    with open(pkg.configure_args_path, "w", encoding="utf-8") as f:
+                        f.write(" ".join(shlex.quote(a) for a in args))
+                    break
+                except Exception:
+                    pass
+
+            # For develop packages or non-develop packages with --keep-stage there may be a
+            # pre-existing symlink at pkg.log_path which would cause the new symlink to fail.
+            # Try removing it if it exists.
             try:
-                args = getattr(pkg, attr)()
-                with open(pkg.configure_args_path, "w", encoding="utf-8") as f:
-                    f.write(" ".join(shlex.quote(a) for a in args))
-                break
-            except Exception:
+                os.unlink(pkg.log_path)
+            except OSError:
                 pass
+            os.symlink(request.log_path, pkg.log_path)
 
-        # For develop packages or non-develop packages with --keep-stage there may be a
-        # pre-existing symlink at pkg.log_path which would cause the new symlink to fail.
-        # Try removing it if it exists.
-        try:
-            os.unlink(pkg.log_path)
-        except OSError:
-            pass
-        os.symlink(request.log_path, pkg.log_path)
+            send_state("staging", state_stream)
 
-        send_state("staging", state_stream)
+            with timer.measure("stage"):
+                if not request.skip_patch:
+                    pkg.do_patch()
+                else:
+                    pkg.do_stage()
 
-        with timer.measure("stage"):
-            if not request.skip_patch:
-                pkg.do_patch()
-            else:
-                pkg.do_stage()
+            os.chdir(stage.source_path)
 
-        os.chdir(stage.source_path)
+            if request.install_source and os.path.isdir(stage.source_path):
+                src_target = os.path.join(spec.prefix, "share", spec.name, "src")
+                fs.install_tree(stage.source_path, src_target)
 
-        if request.install_source and os.path.isdir(stage.source_path):
-            src_target = os.path.join(spec.prefix, "share", spec.name, "src")
-            fs.install_tree(stage.source_path, src_target)
+            spack.hooks.pre_install(spec)
 
-        spack.hooks.pre_install(spec)
+            builder = spack.builder.create(pkg)
+            stop_before, stop_at = request.stop_before, request.stop_at
+            if stop_before is not None and stop_before not in builder.phases:
+                raise spack.error.InstallError(
+                    f"'{stop_before}' is not a valid phase for {pkg.name}"
+                )
+            if stop_at is not None and stop_at not in builder.phases:
+                raise spack.error.InstallError(f"'{stop_at}' is not a valid phase for {pkg.name}")
 
-        builder = spack.builder.create(pkg)
-        stop_before, stop_at = request.stop_before, request.stop_at
-        if stop_before is not None and stop_before not in builder.phases:
-            raise spack.error.InstallError(f"'{stop_before}' is not a valid phase for {pkg.name}")
-        if stop_at is not None and stop_at not in builder.phases:
-            raise spack.error.InstallError(f"'{stop_at}' is not a valid phase for {pkg.name}")
+            _enable_sandbox(
+                spack.config.CONFIG.get("config:sandbox", {}),
+                spec,
+                stage.path,
+                final_prefix=final_prefix,
+            )
 
-        _enable_sandbox(spack.config.CONFIG.get("config:sandbox", {}), spec, stage.path)
+            for phase in builder:
+                if stop_before is not None and phase.name == stop_before:
+                    send_state(f"stopped before {stop_before}", state_stream)
+                    raise spack.error.StopPhase(f"Stopping before '{stop_before}'")
+                send_state(phase.name, state_stream)
+                spack.util.tty.msg(f"{pkg.name}: Executing phase: '{phase.name}'")
+                # Run the install phase with debug output enabled.
+                old_debug = spack.util.tty.debug_level()
+                spack.util.tty.set_debug(1)
+                try:
+                    with timer.measure(phase.name):
+                        phase.execute()
+                finally:
+                    spack.util.tty.set_debug(old_debug)
+                if stop_at is not None and phase.name == stop_at:
+                    send_state(f"stopped after {stop_at}", state_stream)
+                    raise spack.error.StopPhase(f"Stopping at '{stop_at}'")
 
-        for phase in builder:
-            if stop_before is not None and phase.name == stop_before:
-                send_state(f"stopped before {stop_before}", state_stream)
-                raise spack.error.StopPhase(f"Stopping before '{stop_before}'")
-            send_state(phase.name, state_stream)
-            spack.util.tty.msg(f"{pkg.name}: Executing phase: '{phase.name}'")
-            # Run the install phase with debug output enabled.
-            old_debug = spack.util.tty.debug_level()
-            spack.util.tty.set_debug(1)
-            try:
-                with timer.measure(phase.name):
-                    phase.execute()
-            finally:
-                spack.util.tty.set_debug(old_debug)
-            if stop_at is not None and phase.name == stop_at:
-                send_state(f"stopped after {stop_at}", state_stream)
-                raise spack.error.StopPhase(f"Stopping at '{stop_at}'")
+            _archive_build_metadata(pkg)
 
-        _archive_build_metadata(pkg)
-        _post_install(pkg, spec, explicit, timer, cache=False)
+            if staging_prefix:
+                _relocate_install_stage(
+                    pkg=pkg,
+                    spec=spec,
+                    staging_prefix=staging_prefix,
+                    final_prefix=final_prefix,
+                    staging_root=staging_root,
+                    store=store,
+                    timer=timer,
+                    keep_stage=request.keep_stage,
+                )
+
+            _post_install(pkg, spec, explicit, timer, cache=False)
+    finally:
+        if staging_prefix and spec.prefix != final_prefix:
+            spec.set_prefix(final_prefix)
+            if not request.keep_stage and not request.keep_prefix:
+                shutil.rmtree(staging_prefix, ignore_errors=True)
 
 
 def _post_install(

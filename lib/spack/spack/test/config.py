@@ -526,6 +526,22 @@ def test_change_or_add(mutable_config: Configuration, mock_packages):
             ],
             [full_padded_string, os.sep + "path", None],
         ),
+        (
+            [
+                ["config:install_tree:root", os.sep + "path"],
+                ["config:install_tree:padded_length", 11],
+                ["config:install_stage", os.sep + "stage"],
+            ],
+            [os.sep + "path", os.sep + "path", None],
+        ),
+        (
+            [
+                ["config:install_tree:root", os.sep + "path"],
+                ["config:install_tree:padded_length", 11],
+                ["config:install_tree:install_stage", os.sep + "stage"],
+            ],
+            [os.sep + "path", os.sep + "path", None],
+        ),
     ],
 )
 def test_parse_install_tree_padded(config_settings, expected, mutable_config):

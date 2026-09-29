@@ -14,9 +14,11 @@ def post_install(spec, explicit):
     if spec.external:
         return
 
-    # Do nothing if package was not installed from source
+    # Do nothing if package was not installed from source or already pushed
     pkg = spec.package
-    if pkg.installed_from_binary_cache:
+    if getattr(pkg, "_autopushed", False):
+        return
+    if getattr(pkg, "installed_from_binary_cache", False):
         return
 
     # Push the package to all autopush mirrors
